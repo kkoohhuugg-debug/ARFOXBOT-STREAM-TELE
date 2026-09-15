@@ -1,23 +1,44 @@
 import asyncio
+import html
 import json
+import os
 import random
 import re
+import threading
 import urllib.parse
+from http.server import BaseHTTPRequestHandler, HTTPServer
 import httpx
 from telegram import Update
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
-    MessageHandler,
     ContextTypes,
+    MessageHandler,
     filters,
 )
 
 # توكن بوت التلغرام الخاص بك
 TELEGRAM_TOKEN = "8984966726:AAGnqqbhtvfmQtF6oqBPJPrSwDqZIhiP3RQ"
 
-# 1. رمز القناة المرجعي (محفوظ كما هو من الكود الأصلي)
+# 1. رمز القناة المرجعي
 CHANNEL_INVITE_CODE = "0029VbC9XL2GJP8HPaVgWt1S"
+
+
+# خادم بسيط لاستجابة Railway Health Check وتفادي الـ Crash
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"Bot is running successfully!")
+
+    def log_message(self, format, *args):
+        return
+
+
+def start_health_check_server():
+    port = int(os.environ.get("PORT", 8080))
+    server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
+    server.serve_forever()
 
 
 # 2. إيموجيات حزينة متناسقة
@@ -47,7 +68,7 @@ def get_sad_emoji(quote_text: str) -> str:
     return random.choice(sad_emoji_sets)
 
 
-# 3. الاتصال بـ API الذكاء الاصطناعي
+# 3. الاتصال بـ API الذكاء الاصطناعي مع معالجة الأخطاء
 async def call_gpt_api(prompt: str) -> str:
     encoded_prompt = urllib.parse.quote(prompt)
     url = f"https://engez.a7a.online/api/v1/ai/gpt?q={encoded_prompt}"
@@ -56,19 +77,22 @@ async def call_gpt_api(prompt: str) -> str:
     }
 
     async with httpx.AsyncClient(timeout=60.0) as client:
-        response = await client.get(url, headers=headers)
-        res_data = response.json()
+        try:
+            response = await client.get(url, headers=headers)
+            if response.status_code != 200:
+                raise Exception(f"خطأ في الاستجابة: status {response.status_code}")
+            res_data = response.json()
+        except Exception as e:
+            raise Exception(f"فشل الاتصال بالخادم: {str(e)}")
 
         if res_data.get("success") and res_data.get("response", {}).get("success"):
             resp = res_data.get("response", {})
             reply = (
-                resp.get("result", {}).get("message")
-                or resp.get("raw")
-                or ""
+                resp.get("result", {}).get("message") or resp.get("raw") or ""
             )
             return reply
         else:
-            raise Exception("فشل الرد من الخادم")
+            raise Exception("فشل الرد من خادم الذكاء الاصطناعي")
 
 
 # دالة تنظيف صارمة لحذف الأكواد والمُعرّفات والرموز الغريبة
@@ -78,7 +102,9 @@ def clean_quote_text(text: str) -> str:
     text = re.sub(r":::[^\s]*", "", text)
     text = re.sub(r"\{[^}]*\}", "", text)
     text = re.sub(r"\[[^\]]*\]", "", text)
-    text = re.sub(r'id\s*=\s*["\']?[^"\'\s\}]+["\']?', "", text, flags=re.IGNORECASE)
+    text = re.sub(
+        r'id\s*=\s*["\']?[^"\'\s\}]+["\']?', "", text, flags=re.IGNORECASE
+    )
     text = re.sub(r'["\'\}\{\[\]\\]', "", text)
     text = re.sub(r"^[\d\.\-\*•\)\(\s]+", "", text)
     text = re.sub(r'^["\'«»‏\s]+|["\'«»\s]+$', "", text)
@@ -87,7 +113,7 @@ def clean_quote_text(text: str) -> str:
     return text.strip()
 
 
-# دالة التحقق من أن السطر نص عربي حقيقي وليس كوداً
+# دالة التحقق من أن السطر نص عربي حقيقي
 def is_valid_arabic_quote(line: str) -> bool:
     if not line or len(line) < 10:
         return False
@@ -153,18 +179,18 @@ async def run_publish_job(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 continue
 
             matched_emoji = get_sad_emoji(clean_quote)
-            formatted_quote = f"*‏{clean_quote} {matched_emoji}*"
+            # التنسيق باستخدام HTML لتفادي أخطاء Markdown
+            safe_quote = html.escape(clean_quote)
+            formatted_quote = f"<b>‏{safe_quote} {matched_emoji}</b>"
 
             try:
-                # إرسال الرسالة للمحادثة/القناة التي طُلب منها الأمر
                 await update.effective_chat.send_message(
-                    text=formatted_quote, parse_mode="Markdown"
+                    text=formatted_quote, parse_mode="HTML"
                 )
                 success_count += 1
             except Exception as post_err:
                 last_error = str(post_err)
 
-            # تأخير 2.5 ثانية بين الرسائل
             await asyncio.sleep(2.5)
 
     except Exception as err:
@@ -178,36 +204,38 @@ async def run_publish_job(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def quote_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         await update.message.reply_text(
-            "🤖 *جاري بدء توليد ونشر 15 إقتباساً في قناة واتساب ...*",
-            parse_mode="Markdown",
+            "🤖 <b>جاري بدء توليد ونشر 15 إقتباساً...</b>", parse_mode="HTML"
         )
 
         result = await run_publish_job(update, context)
 
         if result["successCount"] == 0:
+            safe_err = html.escape(str(result["error"]))
             await update.message.reply_text(
-                f"❌ *فشل النشر:*\n`{result['error']}`", parse_mode="Markdown"
+                f"❌ <b>فشل النشر:</b>\n<code>{safe_err}</code>",
+                parse_mode="HTML",
             )
             return
 
         await update.message.reply_text(
-            f"*✅ تم نشر [ {result['successCount']} ] إقتباساً بنجاح*",
-            parse_mode="Markdown",
+            f"<b>✅ تم نشر [ {result['successCount']} ] إقتباساً بنجاح</b>",
+            parse_mode="HTML",
         )
 
     except Exception as e:
+        safe_exc = html.escape(str(e))
         await update.message.reply_text(
-            f"❌ حدث خطأ غير متوقع: {str(e)}", parse_mode="Markdown"
+            f"❌ حدث خطأ غير متوقع: {safe_exc}", parse_mode="HTML"
         )
 
 
 def main():
+    # تشغيل خادم منفذ Railway في خلفية البرنامج
+    threading.Thread(target=start_health_check_server, daemon=True).start()
+
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
 
-    # الاستجابة لأوامر /quote أو /اقتباس أو /اقتباسات
     app.add_handler(CommandHandler(["quote", "اقتباس", "اقتباسات"], quote_handler))
-
-    # الاستجابة عند كتابة الكلمات بدون رمز السلاش /
     app.add_handler(
         MessageHandler(
             filters.Regex(r"^(quote|اقتباس|اقتباسات)$") & ~filters.COMMAND,
