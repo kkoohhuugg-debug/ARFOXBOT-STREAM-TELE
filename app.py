@@ -4,9 +4,7 @@ import json
 import os
 import random
 import re
-import threading
 import urllib.parse
-from http.server import BaseHTTPRequestHandler, HTTPServer
 import httpx
 from telegram import Update
 from telegram.ext import (
@@ -17,40 +15,18 @@ from telegram.ext import (
     filters,
 )
 
-# توكن بوت التلغرام الخاص بك
 TELEGRAM_TOKEN = "8984966726:AAGnqqbhtvfmQtF6oqBPJPrSwDqZIhiP3RQ"
 
-# 1. رمز القناة المرجعي
-CHANNEL_INVITE_CODE = "0029VbC9XL2GJP8HPaVgWt1S"
 
-
-# خادم بسيط لاستجابة Railway Health Check وتفادي الـ Crash
-class HealthCheckHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b"Bot is running successfully!")
-
-    def log_message(self, format, *args):
-        return
-
-
-def start_health_check_server():
-    port = int(os.environ.get("PORT", 8080))
-    server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
-    server.serve_forever()
-
-
-# 2. إيموجيات حزينة متناسقة
 def get_sad_emoji(quote_text: str) -> str:
     txt = quote_text.lower()
-    if "موت" in txt or "فقد" in txt or "رحيل" in txt:
+    if any(w in txt for w in ["موت", "فقد", "رحيل"]):
         return "🥀🖤"
-    if "دموع" in txt or "بكاء" in txt or "مطر" in txt or "تبكي" in txt:
+    if any(w in txt for w in ["دموع", "بكاء", "مطر", "تبكي"]):
         return "🌧️💔"
-    if "شوق" in txt or "حنين" in txt or "غياب" in txt or "اشتياق" in txt:
+    if any(w in txt for w in ["شوق", "حنين", "غياب", "اشتياق"]):
         return "🖤🕊️"
-    if "قلب" in txt or "كسر" in txt or "جرح" in txt or "وجع" in txt:
+    if any(w in txt for w in ["قلب", "كسر", "جرح", "وجع"]):
         return "💔🍂"
 
     sad_emoji_sets = [
@@ -68,7 +44,6 @@ def get_sad_emoji(quote_text: str) -> str:
     return random.choice(sad_emoji_sets)
 
 
-# 3. الاتصال بـ API الذكاء الاصطناعي مع معالجة الأخطاء
 async def call_gpt_api(prompt: str) -> str:
     encoded_prompt = urllib.parse.quote(prompt)
     url = f"https://engez.a7a.online/api/v1/ai/gpt?q={encoded_prompt}"
@@ -79,23 +54,17 @@ async def call_gpt_api(prompt: str) -> str:
     async with httpx.AsyncClient(timeout=60.0) as client:
         try:
             response = await client.get(url, headers=headers)
-            if response.status_code != 200:
-                raise Exception(f"خطأ في الاستجابة: status {response.status_code}")
             res_data = response.json()
         except Exception as e:
-            raise Exception(f"فشل الاتصال بالخادم: {str(e)}")
+            raise Exception(f"خطأ اتصال بالمزود: {str(e)}")
 
         if res_data.get("success") and res_data.get("response", {}).get("success"):
             resp = res_data.get("response", {})
-            reply = (
-                resp.get("result", {}).get("message") or resp.get("raw") or ""
-            )
-            return reply
+            return resp.get("result", {}).get("message") or resp.get("raw") or ""
         else:
-            raise Exception("فشل الرد من خادم الذكاء الاصطناعي")
+            raise Exception("لم يتوفر رد صالح من AI")
 
 
-# دالة تنظيف صارمة لحذف الأكواد والمُعرّفات والرموز الغريبة
 def clean_quote_text(text: str) -> str:
     if not text:
         return ""
@@ -113,7 +82,6 @@ def clean_quote_text(text: str) -> str:
     return text.strip()
 
 
-# دالة التحقق من أن السطر نص عربي حقيقي
 def is_valid_arabic_quote(line: str) -> bool:
     if not line or len(line) < 10:
         return False
@@ -128,7 +96,6 @@ def is_valid_arabic_quote(line: str) -> bool:
     return not is_artifact and len(arabic_letters) >= 6
 
 
-# 4. دالة التوليد الضامنة لـ 15 إقتباساً نقياً 100%
 async def generate_exactly_15_quotes() -> list:
     accumulated_quotes = []
     attempts = 0
@@ -145,14 +112,12 @@ async def generate_exactly_15_quotes() -> list:
 
         try:
             raw_reply = await call_gpt_api(prompt)
-
             parsed_lines = [
                 clean_quote_text(line)
                 for line in raw_reply.split("\n")
                 if is_valid_arabic_quote(clean_quote_text(line))
                 and clean_quote_text(line) not in accumulated_quotes
             ]
-
             accumulated_quotes.extend(parsed_lines)
         except Exception as e:
             print(f"محاولة AI رقم {attempts} فشلت: {e}")
@@ -160,7 +125,6 @@ async def generate_exactly_15_quotes() -> list:
     return accumulated_quotes[:15]
 
 
-# 5. دالة النشر والتأكد من العدد الفعلي المنشور
 async def run_publish_job(update: Update, context: ContextTypes.DEFAULT_TYPE):
     success_count = 0
     last_error = ""
@@ -169,17 +133,14 @@ async def run_publish_job(update: Update, context: ContextTypes.DEFAULT_TYPE):
         quotes_list = await generate_exactly_15_quotes()
 
         if not quotes_list:
-            print("⚠️ لم يتم جلب إقتباسات في هذه الدورة.")
-            return {"successCount": 0, "error": "تعذر جلب البيانات."}
+            return {"successCount": 0, "error": "تعذر جلب البيانات من الذكاء الاصطناعي."}
 
         for quote in quotes_list:
             clean_quote = clean_quote_text(quote)
-
             if not is_valid_arabic_quote(clean_quote):
                 continue
 
             matched_emoji = get_sad_emoji(clean_quote)
-            # التنسيق باستخدام HTML لتفادي أخطاء Markdown
             safe_quote = html.escape(clean_quote)
             formatted_quote = f"<b>‏{safe_quote} {matched_emoji}</b>"
 
@@ -196,17 +157,14 @@ async def run_publish_job(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as err:
         last_error = str(err)
 
-    print(f"✅ تم نشر {success_count} إقتباس بنجاح.")
     return {"successCount": success_count, "error": last_error}
 
 
-# معالج الأوامر الرئيسي (quote, اقتباس, اقتباسات)
 async def quote_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         await update.message.reply_text(
             "🤖 <b>جاري بدء توليد ونشر 15 إقتباساً...</b>", parse_mode="HTML"
         )
-
         result = await run_publish_job(update, context)
 
         if result["successCount"] == 0:
@@ -221,7 +179,6 @@ async def quote_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"<b>✅ تم نشر [ {result['successCount']} ] إقتباساً بنجاح</b>",
             parse_mode="HTML",
         )
-
     except Exception as e:
         safe_exc = html.escape(str(e))
         await update.message.reply_text(
@@ -230,11 +187,8 @@ async def quote_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 def main():
-    # تشغيل خادم منفذ Railway في خلفية البرنامج
-    threading.Thread(target=start_health_check_server, daemon=True).start()
-
+    print("🤖 البوت يعمل بنجاح...")
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
-
     app.add_handler(CommandHandler(["quote", "اقتباس", "اقتباسات"], quote_handler))
     app.add_handler(
         MessageHandler(
@@ -242,9 +196,7 @@ def main():
             quote_handler,
         )
     )
-
-    print("🤖 بوت التلغرام يعمل الآن...")
-    app.run_polling()
+    app.run_polling(drop_pending_updates=True)
 
 
 if __name__ == "__main__":
