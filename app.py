@@ -1,196 +1,223 @@
 import asyncio
+import json
 import random
-import time
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+import re
+import urllib.parse
+import httpx
+from telegram import Update
 from telegram.ext import (
     ApplicationBuilder,
-    CallbackQueryHandler,
     CommandHandler,
+    MessageHandler,
     ContextTypes,
+    filters,
 )
 
-# ----------------------------------------------------
-# 1. كلاس المحاكاة (مطابق لمنطق JavaScript تماماً)
-# ----------------------------------------------------
-class FakeLikesSimulator:
-    def __init__(self, target=1000000):
-        self.likes = 0
-        self.running = False
-        self.speed = 100
-        self.target = target
-        self.started_at = None
-        self.status = "⏸️ Stopped"
-        self.task = None
+# توكن بوت التلغرام الخاص بك
+TELEGRAM_TOKEN = "8984966726:AAGnqqbhtvfmQtF6oqBPJPrSwDqZIhiP3RQ"
 
-    def random_likes(self):
-        # min = 500, max = 5000
-        return random.randint(500, 5000)
+# 1. رمز القناة المرجعي (محفوظ كما هو من الكود الأصلي)
+CHANNEL_INVITE_CODE = "0029VbC9XL2GJP8HPaVgWt1S"
 
-    def get_progress_bar(self, total_blocks=10):
-        percent = min((self.likes / self.target), 1.0)
-        filled = int(total_blocks * percent)
-        bar = "🟩" * filled + "⬛" * (total_blocks - filled)
-        return f"{bar} {percent * 100:.1f}%"
 
-    def render_message(self):
-        # تنسيق واجهة المستخدم لتناسب تلغرام
-        return (
-            "❤️ <b>Fake WhatsApp Likes</b>\n\n"
-            f"<b>Likes:</b> <code>{self.likes:,}</code>\n\n"
-            f"<b>Progress:</b>\n{self.get_progress_bar()}\n\n"
-            f"<b>Status:</b> {self.status}\n"
-            f"<b>⚡ Speed:</b> {self.speed:,} likes/sec"
+# 2. إيموجيات حزينة متناسقة
+def get_sad_emoji(quote_text: str) -> str:
+    txt = quote_text.lower()
+    if "موت" in txt or "فقد" in txt or "رحيل" in txt:
+        return "🥀🖤"
+    if "دموع" in txt or "بكاء" in txt or "مطر" in txt or "تبكي" in txt:
+        return "🌧️💔"
+    if "شوق" in txt or "حنين" in txt or "غياب" in txt or "اشتياق" in txt:
+        return "🖤🕊️"
+    if "قلب" in txt or "كسر" in txt or "جرح" in txt or "وجع" in txt:
+        return "💔🍂"
+
+    sad_emoji_sets = [
+        "🖤✨",
+        "🥀💔",
+        "🌧️🤍",
+        "🥀✨",
+        "🖤🕊️",
+        "🌧️🖤",
+        "💔🍂",
+        "🖤🥀",
+        "😭💔",
+        "🥀😭",
+    ]
+    return random.choice(sad_emoji_sets)
+
+
+# 3. الاتصال بـ API الذكاء الاصطناعي
+async def call_gpt_api(prompt: str) -> str:
+    encoded_prompt = urllib.parse.quote(prompt)
+    url = f"https://engez.a7a.online/api/v1/ai/gpt?q={encoded_prompt}"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+    }
+
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        response = await client.get(url, headers=headers)
+        res_data = response.json()
+
+        if res_data.get("success") and res_data.get("response", {}).get("success"):
+            resp = res_data.get("response", {})
+            reply = (
+                resp.get("result", {}).get("message")
+                or resp.get("raw")
+                or ""
+            )
+            return reply
+        else:
+            raise Exception("فشل الرد من الخادم")
+
+
+# دالة تنظيف صارمة لحذف الأكواد والمُعرّفات والرموز الغريبة
+def clean_quote_text(text: str) -> str:
+    if not text:
+        return ""
+    text = re.sub(r":::[^\s]*", "", text)
+    text = re.sub(r"\{[^}]*\}", "", text)
+    text = re.sub(r"\[[^\]]*\]", "", text)
+    text = re.sub(r'id\s*=\s*["\']?[^"\'\s\}]+["\']?', "", text, flags=re.IGNORECASE)
+    text = re.sub(r'["\'\}\{\[\]\\]', "", text)
+    text = re.sub(r"^[\d\.\-\*•\)\(\s]+", "", text)
+    text = re.sub(r'^["\'«»‏\s]+|["\'«»\s]+$', "", text)
+    text = re.sub(r"[\.\!\?،,\s]+$", "", text)
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
+
+
+# دالة التحقق من أن السطر نص عربي حقيقي وليس كوداً
+def is_valid_arabic_quote(line: str) -> bool:
+    if not line or len(line) < 10:
+        return False
+    is_artifact = bool(
+        re.search(
+            r"id=|variant|document|script|html|http|:::|[{}]|\[|\]",
+            line,
+            re.IGNORECASE,
+        )
+    )
+    arabic_letters = re.findall(r"[\u0600-\u06FF]", line)
+    return not is_artifact and len(arabic_letters) >= 6
+
+
+# 4. دالة التوليد الضامنة لـ 15 إقتباساً نقياً 100%
+async def generate_exactly_15_quotes() -> list:
+    accumulated_quotes = []
+    attempts = 0
+
+    while len(accumulated_quotes) < 15 and attempts < 5:
+        attempts += 1
+        needed = 15 - len(accumulated_quotes)
+        prompt = f"""اكتب لي {needed + 10} إقتباسات حزينة ومؤثرة جداً عن الشوق، الفراق، ألم الغياب والخذلان.
+الشروط الصارمة:
+1. اكتب النصوص مباشرة بدون أي وسوم أو أكواد أو رموز برمجية نهائياً.
+2. كل إقتباس في سطر مستقل بدون ترقيم.
+3. لا تضع نقطة (.) في نهاية السطر نهائياً.
+4. بدون أي مقدمات أو خاتمات."""
+
+        try:
+            raw_reply = await call_gpt_api(prompt)
+
+            parsed_lines = [
+                clean_quote_text(line)
+                for line in raw_reply.split("\n")
+                if is_valid_arabic_quote(clean_quote_text(line))
+                and clean_quote_text(line) not in accumulated_quotes
+            ]
+
+            accumulated_quotes.extend(parsed_lines)
+        except Exception as e:
+            print(f"محاولة AI رقم {attempts} فشلت: {e}")
+
+    return accumulated_quotes[:15]
+
+
+# 5. دالة النشر والتأكد من العدد الفعلي المنشور
+async def run_publish_job(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    success_count = 0
+    last_error = ""
+
+    try:
+        quotes_list = await generate_exactly_15_quotes()
+
+        if not quotes_list:
+            print("⚠️ لم يتم جلب إقتباسات في هذه الدورة.")
+            return {"successCount": 0, "error": "تعذر جلب البيانات."}
+
+        for quote in quotes_list:
+            clean_quote = clean_quote_text(quote)
+
+            if not is_valid_arabic_quote(clean_quote):
+                continue
+
+            matched_emoji = get_sad_emoji(clean_quote)
+            formatted_quote = f"*‏{clean_quote} {matched_emoji}*"
+
+            try:
+                # إرسال الرسالة للمحادثة/القناة التي طُلب منها الأمر
+                await update.effective_chat.send_message(
+                    text=formatted_quote, parse_mode="Markdown"
+                )
+                success_count += 1
+            except Exception as post_err:
+                last_error = str(post_err)
+
+            # تأخير 2.5 ثانية بين الرسائل
+            await asyncio.sleep(2.5)
+
+    except Exception as err:
+        last_error = str(err)
+
+    print(f"✅ تم نشر {success_count} إقتباس بنجاح.")
+    return {"successCount": success_count, "error": last_error}
+
+
+# معالج الأوامر الرئيسي (quote, اقتباس, اقتباسات)
+async def quote_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        await update.message.reply_text(
+            "🤖 *جاري بدء توليد ونشر 15 إقتباساً في قناة واتساب ...*",
+            parse_mode="Markdown",
         )
 
-    def get_keyboard(self):
-        # أزرار START / STOP / RESET
-        keyboard = [
-            [
-                InlineKeyboardButton("▶️ START", callback_data="start"),
-                InlineKeyboardButton("⏸️ STOP", callback_data="stop"),
-                InlineKeyboardButton("🔄 RESET", callback_data="reset"),
-            ]
-        ]
-        return InlineKeyboardMarkup(keyboard)
+        result = await run_publish_job(update, context)
 
-    def reset(self):
-        self.running = False
-        if self.task:
-            self.task.cancel()
-            self.task = None
-        self.likes = 0
-        self.speed = 0
-        self.started_at = None
-        self.status = "🔄 Reset"
-
-    def set_target(self, number):
-        if isinstance(number, (int, float)) and number > 0:
-            self.target = number
-
-    def set_speed(self, number):
-        if isinstance(number, (int, float)) and number > 0:
-            self.speed = number
-
-
-# تخزين جلسات المستخدمين (Per User Session)
-user_simulators = {}
-
-def get_user_sim(user_id):
-    if user_id not in user_simulators:
-        user_simulators[user_id] = FakeLikesSimulator()
-    return user_simulators[user_id]
-
-
-# ----------------------------------------------------
-# 2. أوامر ومعالجات تلغرام (Telegram Handlers)
-# ----------------------------------------------------
-async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    sim = get_user_sim(user_id)
-
-    await update.message.reply_text(
-        text=sim.render_message(),
-        parse_mode="HTML",
-        reply_markup=sim.get_keyboard()
-    )
-
-
-async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-
-    user_id = query.from_user.id
-    sim = get_user_sim(user_id)
-    data = query.data
-
-    if data == "start":
-        if sim.running:
+        if result["successCount"] == 0:
+            await update.message.reply_text(
+                f"❌ *فشل النشر:*\n`{result['error']}`", parse_mode="Markdown"
+            )
             return
 
-        sim.running = True
-        sim.started_at = time.time()
-        sim.status = "🟢 Running..."
-
-        # تشغيل دالة التكرار (Tick Loop) في الخلفية
-        sim.task = asyncio.create_task(run_ticks(query, sim))
-
-    elif data == "stop":
-        sim.running = False
-        if sim.task:
-            sim.task.cancel()
-            sim.task = None
-        sim.status = "⏸️ Stopped"
-
-        await query.edit_message_text(
-            text=sim.render_message(),
-            parse_mode="HTML",
-            reply_markup=sim.get_keyboard()
+        await update.message.reply_text(
+            f"*✅ تم نشر [ {result['successCount']} ] إقتباساً بنجاح*",
+            parse_mode="Markdown",
         )
 
-    elif data == "reset":
-        sim.reset()
-        await query.edit_message_text(
-            text=sim.render_message(),
-            parse_mode="HTML",
-            reply_markup=sim.get_keyboard()
+    except Exception as e:
+        await update.message.reply_text(
+            f"❌ حدث خطأ غير متوقع: {str(e)}", parse_mode="Markdown"
         )
 
 
-async def run_ticks(query, sim: FakeLikesSimulator):
-    """
-    دالة الـ Tick المطابقة لـ setInterval:
-    تقوم بالحساب بزيادات سريعة، وتحديث رسالة تلغرام كل 1 ثانية
-    لتجنب حظر البوت بسبب Rate Limit الخاص بتلغرام.
-    """
-    try:
-        last_ui_update = time.time()
+def main():
+    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
 
-        while sim.running:
-            # تنفيذ العمليات الحسابية بنفس منطق randomLikes
-            amount = sim.random_likes()
-            sim.likes += amount
-            sim.speed = amount * 10
+    # الاستجابة لأوامر /quote أو /اقتباس أو /اقتباسات
+    app.add_handler(CommandHandler(["quote", "اقتباس", "اقتباسات"], quote_handler))
 
-            # التحقق من وصول الهدف
-            if sim.likes >= sim.target:
-                sim.likes = sim.target
-                sim.running = False
-                sim.status = "✅ Target reached"
+    # الاستجابة عند كتابة الكلمات بدون رمز السلاش /
+    app.add_handler(
+        MessageHandler(
+            filters.Regex(r"^(quote|اقتباس|اقتباسات)$") & ~filters.COMMAND,
+            quote_handler,
+        )
+    )
 
-                await query.edit_message_text(
-                    text=sim.render_message(),
-                    parse_mode="HTML",
-                    reply_markup=sim.get_keyboard()
-                )
-                break
-
-            # تحديث الواجهة على تلغرام كل 1 ثانية لتجنب 429 Too Many Requests
-            if time.time() - last_ui_update >= 1.0:
-                await query.edit_message_text(
-                    text=sim.render_message(),
-                    parse_mode="HTML",
-                    reply_markup=sim.get_keyboard()
-                )
-                last_ui_update = time.time()
-
-            # التأخير بين كل زيادة وزيادة (تطابق منطق الـ 10ms)
-            await asyncio.sleep(0.01)
-
-    except asyncio.CancelledError:
-        pass
-
-
-# ----------------------------------------------------
-# 3. تشغيل البوت
-# ----------------------------------------------------
-if __name__ == "__main__":
-    TOKEN = "8772396167:AAHoZFrU-QUCbUFzEwuCDl6Y3kBBtT2Iv8g"
-
-    app = ApplicationBuilder().token(TOKEN).build()
-
-    app.add_handler(CommandHandler("start", start_command))
-    app.add_handler(CallbackQueryHandler(button_handler))
-
-    print("❤️ Fake Likes Telegram Bot Started...")
+    print("🤖 بوت التلغرام يعمل الآن...")
     app.run_polling()
 
+
+if __name__ == "__main__":
+    main()
